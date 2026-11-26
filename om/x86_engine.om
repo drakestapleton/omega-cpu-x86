@@ -1,0 +1,1207 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note om/x86_engine.om: Pure-Omega Intel & AMD x86-64 CPU Optimizer Engine (OM-2).
+note Compiles cleanly for BOTH AArch64 (`om2`) and native x86-64 Linux (`target x86linux\nom2`).
+note
+note Subcommands:
+note   probe                     Read-only /proc/cpuinfo live host CPU & ISA feature detection
+note   plan                      Cache-aware L1D/L2/L3 tile plans for all 6 x86-64 silicon profiles
+note   selftest                  Deterministic int/f32 micro-kernels + profile/contract self-checks
+note   check <prof_id> <feat>    Validate physical ISA feature contract (exits 0 on OK, refusal code on fail)
+
+note ---- Profile IDs ----
+const PROF_INTEL_CORE_ULTRA ulong 0
+const PROF_INTEL_XEON_AMX ulong 1
+const PROF_AMD_ZEN4 ulong 2
+const PROF_AMD_ZEN5 ulong 3
+const PROF_AMD_RYZEN_X3D ulong 4
+const PROF_STEAM_DECK_ZEN2 ulong 5
+const X86_NUM_PROFILES ulong 6
+
+note ---- Profile Descriptor Fields (12 fields per profile) ----
+const PF_STRIDE ulong 12
+const PF_VENDOR ulong 0
+const PF_VECBITS ulong 1
+const PF_L1D_KB ulong 2
+const PF_L2_KB ulong 3
+const PF_L3_KB ulong 4
+const PF_LINE ulong 5
+const PF_OOO ulong 6
+const PF_FEAT ulong 7
+const PF_CCDS ulong 8
+const PF_VCACHE_CCD0_KB ulong 9
+const PF_VCACHE_CCD1_KB ulong 10
+const PF_NGPR ulong 11
+
+note ---- Vendor IDs ----
+const VEND_INTEL ulong 1
+const VEND_AMD ulong 2
+
+note ---- x86-64 Feature Bitmask ----
+const XF_AVX2 ulong 1
+const XF_AVX512 ulong 2
+const XF_FMA ulong 4
+const XF_BMI2 ulong 8
+const XF_AMX ulong 16
+const XF_AES ulong 32
+const XF_SHA ulong 64
+
+note ---- Physical Contract Refusal Codes ----
+const XCK_OK ulong 0
+const XCK_ERR_BAD_PROFILE ulong 1
+const XCK_ERR_MISSING_AVX2 ulong 2
+const XCK_ERR_MISSING_AVX512 ulong 3
+const XCK_ERR_MISSING_FMA ulong 4
+const XCK_ERR_MISSING_BMI2 ulong 5
+const XCK_ERR_MISSING_AMX ulong 6
+const XCK_ERR_MISSING_FEAT ulong 7
+const XCK_ERR_VEC_WIDTH ulong 8
+const XCK_ERR_L1_OVERFLOW ulong 9
+const XCK_ERR_L3_OVERFLOW ulong 10
+
+note ---- Global State ----
+global profTab ulong 96
+global tileOut ulong 8
+global digBuf uchar 24
+global hexBuf uchar 16
+global argBuf uchar 64
+global arg2Buf uchar 64
+global arg3Buf uchar 64
+global cpuBuf uchar 32768
+global cpuLen ulong 1
+global valBuf uchar 128
+
+note Micro-kernel scratch arrays
+global kIntA ulong 64
+global kIntB ulong 64
+global kIntPref ulong 64
+global kF32A f32 32
+global kF32B f32 32
+global kF32In f32 32
+global kF32Pref f32 32
+global kGemvM f32 128
+global kGemvX f32 16
+global kGemvYT f32 8
+global kGemvYR f32 8
+
+note ---- Text Strings ----
+text sNl "\n"
+text sSp " "
+text sHex "0123456789abcdef"
+text sCmdProbe "probe"
+text sCmdPlan "plan"
+text sCmdSelf "selftest"
+text sCmdCheck "check"
+text sUsage "usage: x86_engine <probe|plan|selftest|check <prof_id 0..5> <req_feat_mask>>\n"
+
+text sP0 "Intel Core Ultra (Arrow Lake / Lunar Lake)"
+text sP1 "Intel Xeon Scalable (AVX-512 + AMX)"
+text sP2 "AMD Zen 4 (Ryzen 7000 / EPYC Genoa)"
+text sP3 "AMD Zen 5 (Ryzen 9000 / EPYC Turin)"
+text sP4 "AMD Ryzen X3D (96 MiB 3D V-Cache CCD0 vs 32 MiB CCD1)"
+text sP5 "Valve Steam Deck AMD Zen 2 (Van Gogh / Sephiroth)"
+
+text sHdrPlan "=== OMEGA-CPU-X86 CACHE-AWARE TILE PLANNER (FP32, elem=4B) ===\n"
+text sHdrProbe "=== OMEGA-CPU-X86 LIVE /proc/cpuinfo PROBE ===\n"
+text sHdrSelf "=== OMEGA-CPU-X86 DETERMINISTIC ENGINE SELFTEST ===\n"
+text sProfPre "PROFILE["
+text sProfMid "] "
+text sCcd0 "  CCD0(V-Cache): "
+text sCcd1 "  CCD1(Std-L3) : "
+text sCcdU "  UNIFIED      : "
+text sL1 "L1D="
+text sL2 "KiB L2="
+text sL3 "KiB L3="
+text sVec "KiB VEC="
+text sTile "b -> MC="
+text sKc " KC="
+text sNc " NC="
+text sL3Nc " L3_NC="
+text sVe " VEC_ELEMS="
+text sFeat " FEAT_MASK=0x"
+text sKib "KiB"
+
+text sProcCpu "/proc/cpuinfo"
+text sKeyVend "vendor_id"
+text sKeyModel "model name"
+text sKeyCache "cache size"
+text sKeyFlags "flags"
+text sKeyProc "processor"
+text sIntel "GenuineIntel"
+text sAmd "AuthenticAMD"
+text sFAvx2 "avx2"
+text sFAvx512 "avx512f"
+text sFFma "fma"
+text sFBmi2 "bmi2"
+text sFAmx "amx_tile"
+text sFAes "aes"
+text sFSha "sha_ni"
+text sFHyp "hypervisor"
+
+text sOutVend "VENDOR="
+text sOutModel "MODEL="
+text sOutCache "CACHE="
+text sOutCpus "LOGICAL_CPUS="
+text sOutEnvVm "EXEC_ENV=X86_64_VM_NATIVE (hypervisor flag present)\n"
+text sOutEnvBm "EXEC_ENV=X86_64_BARE_METAL\n"
+text sOutEnvOther "EXEC_ENV=NON_X86_64_OR_UNAVAILABLE\n"
+text sOutFeat "HOST_FEAT_MASK=0x"
+text sOutFlags "DETECTED_ISA="
+text sTagAvx2 "AVX2 "
+text sTagAvx512 "AVX512 "
+text sTagFma "FMA "
+text sTagBmi2 "BMI2 "
+text sTagAmx "AMX "
+text sTagAes "AES "
+text sTagSha "SHA "
+text sTagNone "NONE"
+text sOutMatch "MATCHED_PROFILE="
+
+text sSelfPass "X86-ENGINE-SELFTEST PASS checks="
+text sSelfCtrl " controls="
+text sSelfFail "X86-ENGINE-SELFTEST FAIL at check="
+text sCkOk "CONTRACT_OK profile="
+text sCkRef "CONTRACT_REFUSED profile="
+text sCkCode " code="
+text sCkRsn " reason="
+text sRsnBad "BAD_PROFILE"
+text sRsnAvx2 "MISSING_AVX2"
+text sRsnAvx512 "MISSING_AVX512"
+text sRsnFma "MISSING_FMA"
+text sRsnBmi2 "MISSING_BMI2"
+text sRsnAmx "MISSING_AMX"
+text sRsnFeat "MISSING_FEATURE"
+text sRsnVec "VEC_WIDTH_EXCEEDED"
+text sRsnL1 "L1D_OVERFLOW"
+text sRsnL3 "L3_OVERFLOW"
+
+note ---- Output Helpers ----
+fn outText t view uchar * to void
+w = write 1 t 0 len t
+end
+
+fn outNum v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put digBuf p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+w = write 1 digBuf p sub 24 p
+ret
+end
+end
+end
+
+fn outHex v ulong to void
+x = v
+p = ulong 16
+for i ulong 16
+p = sub p 1
+nib = and x 15
+put hexBuf p get sHex nib
+x = shr x 4
+if eq x 0
+w = write 1 hexBuf p sub 16 p
+ret
+end
+end
+end
+
+fn outProfName pid ulong to void
+if eq pid PROF_INTEL_CORE_ULTRA
+outText sP0
+ret
+end
+if eq pid PROF_INTEL_XEON_AMX
+outText sP1
+ret
+end
+if eq pid PROF_AMD_ZEN4
+outText sP2
+ret
+end
+if eq pid PROF_AMD_ZEN5
+outText sP3
+ret
+end
+if eq pid PROF_AMD_RYZEN_X3D
+outText sP4
+ret
+end
+outText sP5
+end
+
+fn outRefusalReason code ulong to void
+if eq code XCK_ERR_BAD_PROFILE
+outText sRsnBad
+ret
+end
+if eq code XCK_ERR_MISSING_AVX2
+outText sRsnAvx2
+ret
+end
+if eq code XCK_ERR_MISSING_AVX512
+outText sRsnAvx512
+ret
+end
+if eq code XCK_ERR_MISSING_FMA
+outText sRsnFma
+ret
+end
+if eq code XCK_ERR_MISSING_BMI2
+outText sRsnBmi2
+ret
+end
+if eq code XCK_ERR_MISSING_AMX
+outText sRsnAmx
+ret
+end
+if eq code XCK_ERR_VEC_WIDTH
+outText sRsnVec
+ret
+end
+if eq code XCK_ERR_L1_OVERFLOW
+outText sRsnL1
+ret
+end
+if eq code XCK_ERR_L3_OVERFLOW
+outText sRsnL3
+ret
+end
+outText sRsnFeat
+end
+
+note ---- Profile Table Accessors & Initialization ----
+fn pSet pid ulong fld ulong val ulong to void
+put profTab add mul pid PF_STRIDE fld val
+end
+
+fn pGet pid ulong fld ulong to ulong
+ret get profTab add mul pid PF_STRIDE fld
+end
+
+fn pRegCore pid ulong vend ulong vbits ulong l1 ulong l2 ulong l3 ulong to void
+pSet pid PF_VENDOR vend
+pSet pid PF_VECBITS vbits
+pSet pid PF_L1D_KB l1
+pSet pid PF_L2_KB l2
+pSet pid PF_L3_KB l3
+pSet pid PF_LINE 64
+end
+
+fn pRegExtra pid ulong ooo ulong feat ulong ccds ulong vc0 ulong vc1 ulong to void
+pSet pid PF_OOO ooo
+pSet pid PF_FEAT feat
+pSet pid PF_CCDS ccds
+pSet pid PF_VCACHE_CCD0_KB vc0
+pSet pid PF_VCACHE_CCD1_KB vc1
+pSet pid PF_NGPR 15
+end
+
+fn x86InitProfiles to void
+note 0: Intel Core Ultra (AVX2 + FMA + BMI2 + AES + SHA = 1+4+8+32+64 = 109; no AVX-512, no AMX)
+pRegCore PROF_INTEL_CORE_ULTRA VEND_INTEL 256 48 3072 36864
+pRegExtra PROF_INTEL_CORE_ULTRA 8 109 1 0 0
+
+note 1: Intel Xeon Scalable AMX (AVX2 + AVX512 + FMA + BMI2 + AMX + AES + SHA = 127)
+pRegCore PROF_INTEL_XEON_AMX VEND_INTEL 512 48 2048 107520
+pRegExtra PROF_INTEL_XEON_AMX 6 127 1 0 0
+
+note 2: AMD Zen 4 (AVX2 + AVX512 + FMA + BMI2 + AES + SHA = 111; no AMX)
+pRegCore PROF_AMD_ZEN4 VEND_AMD 512 32 1024 32768
+pRegExtra PROF_AMD_ZEN4 6 111 1 0 0
+
+note 3: AMD Zen 5 (AVX2 + AVX512 + FMA + BMI2 + AES + SHA = 111; full 512b datapath, 48 KiB L1D)
+pRegCore PROF_AMD_ZEN5 VEND_AMD 512 48 1024 32768
+pRegExtra PROF_AMD_ZEN5 8 111 1 0 0
+
+note 4: AMD Ryzen X3D Dual-CCD (96 MiB = 98304 KiB 3D V-Cache on CCD0 vs 32 MiB = 32768 KiB on CCD1)
+pRegCore PROF_AMD_RYZEN_X3D VEND_AMD 512 48 1024 98304
+pRegExtra PROF_AMD_RYZEN_X3D 8 111 2 98304 32768
+
+note 5: Steam Deck AMD Zen 2 (Van Gogh / Sephiroth: AVX2 + FMA + BMI2 + AES + SHA = 109; 4 MiB L3)
+pRegCore PROF_STEAM_DECK_ZEN2 VEND_AMD 256 32 512 4096
+pRegExtra PROF_STEAM_DECK_ZEN2 4 109 1 0 0
+end
+
+note ---- Physical Feature & Cache Contract Validator ----
+fn x86CheckContract pid ulong reqFeat ulong reqVec ulong reqL1Kb ulong reqL3Kb ulong to ulong
+if ge pid X86_NUM_PROFILES
+ret XCK_ERR_BAD_PROFILE
+end
+have = pGet pid PF_FEAT
+if and ne and reqFeat XF_AVX2 0 eq and have XF_AVX2 0
+ret XCK_ERR_MISSING_AVX2
+end
+if and ne and reqFeat XF_AVX512 0 eq and have XF_AVX512 0
+ret XCK_ERR_MISSING_AVX512
+end
+if and ne and reqFeat XF_FMA 0 eq and have XF_FMA 0
+ret XCK_ERR_MISSING_FMA
+end
+if and ne and reqFeat XF_BMI2 0 eq and have XF_BMI2 0
+ret XCK_ERR_MISSING_BMI2
+end
+if and ne and reqFeat XF_AMX 0 eq and have XF_AMX 0
+ret XCK_ERR_MISSING_AMX
+end
+if ne and reqFeat have reqFeat
+ret XCK_ERR_MISSING_FEAT
+end
+if gt reqVec pGet pid PF_VECBITS
+ret XCK_ERR_VEC_WIDTH
+end
+if gt reqL1Kb pGet pid PF_L1D_KB
+ret XCK_ERR_L1_OVERFLOW
+end
+if gt reqL3Kb pGet pid PF_L3_KB
+ret XCK_ERR_L3_OVERFLOW
+end
+ret XCK_OK
+end
+
+note ---- Cache-Aware L1D/L2/L3 Tile Planner ----
+note Writes tileOut: [0]=MC, [1]=KC, [2]=NC, [3]=L3_NC, [4]=VEC_ELEMS, [5]=EFF_L3_KB
+fn x86PlanTile pid ulong elemBytes ulong ccdIdx ulong to void
+vbits = pGet pid PF_VECBITS
+ve = div vbits mul elemBytes 8
+if eq ve 0
+ve = ulong 1
+end
+l1b = mul pGet pid PF_L1D_KB 1024
+l2b = mul pGet pid PF_L2_KB 1024
+l3kb = pGet pid PF_L3_KB
+if gt pGet pid PF_CCDS 1
+if eq ccdIdx 0
+l3kb = pGet pid PF_VCACHE_CCD0_KB
+else
+l3kb = pGet pid PF_VCACHE_CCD1_KB
+end
+end
+l3b = mul l3kb 1024
+
+note KC fits 4 register-width micro-panels cleanly inside L1D
+kc = div l1b mul mul ve elemBytes 4
+kc = mul div kc 16 16
+if lt kc 32
+kc = ulong 32
+end
+if gt kc 512
+kc = ulong 512
+end
+
+note MC is register-blocked to 4 vector widths
+mc = mul ve 4
+
+note NC fits double-buffered B-panel inside private L2
+nc = div l2b mul mul kc elemBytes 2
+nc = mul div nc ve ve
+if lt nc 64
+nc = ulong 64
+end
+if gt nc 2048
+nc = ulong 2048
+end
+
+note L3_NC captures macro L3 cache residency (reflects 96 MiB X3D CCD0 vs 32 MiB CCD1 vs 4 MiB Zen2)
+l3nc = div l3b mul mul kc elemBytes 2
+l3nc = mul div l3nc 64 64
+if lt l3nc 256
+l3nc = ulong 256
+end
+if gt l3nc 65536
+l3nc = ulong 65536
+end
+
+put tileOut 0 mc
+put tileOut 1 kc
+put tileOut 2 nc
+put tileOut 3 l3nc
+put tileOut 4 ve
+put tileOut 5 l3kb
+end
+
+note ---- Deterministic Micro-Kernels ----
+note 1. Integer dot-product micro-kernel (64 elements, 4-way unrolled vs scalar oracle)
+fn mkTestIntDot to bool
+for i ulong 64
+put kIntA i rem add mul i 7 3 251
+put kIntB i rem add mul i 13 5 199
+end
+s0 = ulong 0
+s1 = ulong 0
+s2 = ulong 0
+s3 = ulong 0
+for b ulong 16
+idx = mul b 4
+s0 = add s0 mul get kIntA idx get kIntB idx
+s1 = add s1 mul get kIntA add idx 1 get kIntB add idx 1
+s2 = add s2 mul get kIntA add idx 2 get kIntB add idx 2
+s3 = add s3 mul get kIntA add idx 3 get kIntB add idx 3
+end
+unrolled = add add s0 s1 add s2 s3
+ref = ulong 0
+for i ulong 64
+ref = add ref mul get kIntA i get kIntB i
+end
+if ne unrolled ref
+ret false
+end
+if eq ref 0
+ret false
+end
+ret true
+end
+
+note 2. IEEE-754 FP32 dot-product micro-kernel (32 exact dyadic elements -> exact 318.0 = 0x439F0000 = 1134493696)
+fn mkTestF32Dot to bool
+for i ulong 32
+va = mul f32 add i 1 f32 0.25
+vb = mul f32 add rem i 8 1 f32 0.5
+put kF32A i va
+put kF32B i vb
+end
+a0 = f32 0.0
+a1 = f32 0.0
+a2 = f32 0.0
+a3 = f32 0.0
+for b ulong 8
+idx = mul b 4
+a0 = add a0 mul get kF32A idx get kF32B idx
+a1 = add a1 mul get kF32A add idx 1 get kF32B add idx 1
+a2 = add a2 mul get kF32A add idx 2 get kF32B add idx 2
+a3 = add a3 mul get kF32A add idx 3 get kF32B add idx 3
+end
+tiled = add add a0 a1 add a2 a3
+ref = f32 0.0
+for i ulong 32
+ref = add ref mul get kF32A i get kF32B i
+end
+bt = bitcast uint tiled
+br = bitcast uint ref
+if ne bt br
+ret false
+end
+if ne bt uint 1134493696
+ret false
+end
+ret true
+end
+
+fn mkGemvBlock r0 ulong c0 ulong to void
+for dr ulong 4
+r = add r0 dr
+acc = get kGemvYT r
+for dc ulong 4
+c = add c0 dc
+mval = get kGemvM add mul r 16 c
+xval = get kGemvX c
+acc = add acc mul mval xval
+end
+put kGemvYT r acc
+end
+end
+
+note 3. FP32 4x4 Cache-Blocked Tiled GEMV (8x16) vs Scalar Oracle (exact sum 640.0 = 0x44200000 = 1142947840)
+fn mkTestGemvTile to bool
+for r ulong 8
+for c ulong 16
+put kGemvM add mul r 16 c mul f32 add add mul r 2 c 1 f32 0.25
+end
+put kGemvYT r f32 0.0
+put kGemvYR r f32 0.0
+end
+for c ulong 16
+put kGemvX c mul f32 add rem c 4 1 f32 0.5
+end
+
+note Tiled 4x4 micro-kernel
+for rb ulong 2
+for cb ulong 4
+mkGemvBlock mul rb 4 mul cb 4
+end
+end
+
+note Scalar reference
+for r ulong 8
+acc = f32 0.0
+for c ulong 16
+acc = add acc mul get kGemvM add mul r 16 c get kGemvX c
+end
+put kGemvYR r acc
+end
+
+note Exact bit-level lane comparison + exact lane 0 (45.0=1110704128), lane 7 (115.0=1122369536), sum (640.0=1142947840)
+sum = f32 0.0
+for r ulong 8
+yt = get kGemvYT r
+yr = get kGemvYR r
+if ne bitcast uint yt bitcast uint yr
+ret false
+end
+sum = add sum yt
+end
+if ne bitcast uint get kGemvYT 0 uint 1110704128
+ret false
+end
+if ne bitcast uint get kGemvYT 7 uint 1122369536
+ret false
+end
+if ne bitcast uint sum uint 1142947840
+ret false
+end
+ret true
+end
+
+note 4. Deterministic Prefix-Sum (Inclusive Scan) & Reduction (int64 64-elem + f32 32-elem)
+fn mkTestPrefixScan to bool
+accI = ulong 0
+for i ulong 64
+accI = add accI add i 1
+put kIntPref i accI
+end
+for i ulong 64
+expect = div mul add i 1 add i 2 2
+if ne get kIntPref i expect
+ret false
+end
+end
+if ne get kIntPref 63 2080
+ret false
+end
+
+accF = f32 0.0
+for i ulong 32
+v = mul f32 add i 1 f32 0.5
+put kF32In i v
+accF = add accF v
+put kF32Pref i accF
+end
+for i ulong 32
+eI = div mul add i 1 add i 2 2
+eF = mul f32 eI f32 0.5
+if ne bitcast uint get kF32Pref i bitcast uint eF
+ret false
+end
+end
+note Final f32 reduction = 264.0 (0x43840000 = 1132724224)
+if ne bitcast uint get kF32Pref 31 uint 1132724224
+ret false
+end
+ret true
+end
+
+note ---- /proc/cpuinfo Read-Only Parser ----
+fn readCpuInfo to ulong
+fd = fopen sProcCpu 0 len sProcCpu 0 0
+if lt fd 0
+put cpuLen 0 0
+ret 0
+end
+tot = ulong 0
+while lt tot 32768 bound 128
+got = read int fd cpuBuf tot sub 32768 tot
+if le got 0
+break
+end
+tot = add tot ulong got
+end
+rc = fclose int fd
+put cpuLen 0 tot
+ret tot
+end
+
+fn bufMatchAt pos ulong pat view uchar * to bool
+pl = len pat
+n = get cpuLen 0
+if gt add pos pl n
+ret false
+end
+for j ulong pl bound 64
+if ne get cpuBuf add pos j get pat j
+ret false
+end
+end
+ret true
+end
+
+fn cpuNextLine pos ulong n ulong to ulong
+p = pos
+while lt p n bound 512
+ch = get cpuBuf p
+p = add p 1
+if eq ch 10
+ret p
+end
+end
+ret p
+end
+
+fn cpuCopyAfterColon pos ulong n ulong to ulong
+p = pos
+found = false
+while lt p n bound 128
+ch = get cpuBuf p
+if eq ch 10
+ret 0
+end
+p = add p 1
+if eq ch 58
+found = true
+break
+end
+end
+if not found
+ret 0
+end
+while lt p n bound 64
+ch = get cpuBuf p
+if and ne ch 32 ne ch 9
+break
+end
+p = add p 1
+end
+outN = ulong 0
+while and lt p n lt outN 127 bound 128
+ch = get cpuBuf p
+if eq ch 10
+break
+end
+put valBuf outN ch
+outN = add outN 1
+p = add p 1
+end
+ret outN
+end
+
+note Extract value of first line starting with key (copies trimmed text after ':' into valBuf, returns length)
+fn cpuExtractVal key view uchar * to ulong
+n = get cpuLen 0
+if eq n 0
+ret 0
+end
+pos = ulong 0
+while lt pos n bound 1024
+if bufMatchAt pos key
+ret cpuCopyAfterColon pos n
+end
+pos = cpuNextLine pos n
+end
+ret 0
+end
+
+fn cpuFindColon pos ulong n ulong to ulong
+p = pos
+while lt p n bound 64
+ch = get cpuBuf p
+p = add p 1
+if eq ch 58
+ret p
+end
+if eq ch 10
+ret n
+end
+end
+ret n
+end
+
+fn cpuScanFlagsLine start ulong n ulong tok view uchar * to bool
+tl = len tok
+p = start
+while lt p n bound 2048
+ch = get cpuBuf p
+if eq ch 10
+ret false
+end
+if or eq ch 32 eq ch 9
+p = add p 1
+continue
+end
+q = p
+while lt q n bound 64
+c2 = get cpuBuf q
+if or eq c2 32 or eq c2 9 eq c2 10
+break
+end
+q = add q 1
+end
+if eq sub q p tl
+if bufMatchAt p tok
+ret true
+end
+end
+p = q
+end
+ret false
+end
+
+note Check if exact whitespace-delimited flag token appears on the first "flags" line of /proc/cpuinfo
+fn cpuHasFlag tok view uchar * to bool
+n = get cpuLen 0
+if or eq n 0 eq len tok 0
+ret false
+end
+pos = ulong 0
+while lt pos n bound 1024
+if bufMatchAt pos sKeyFlags
+st = cpuFindColon pos n
+if lt st n
+ret cpuScanFlagsLine st n tok
+end
+ret false
+end
+pos = cpuNextLine pos n
+end
+ret false
+end
+
+fn cpuCountLogical to ulong
+n = get cpuLen 0
+cnt = ulong 0
+pos = ulong 0
+while lt pos n bound 2048
+if bufMatchAt pos sKeyProc
+cnt = add cnt 1
+end
+pos = cpuNextLine pos n
+end
+ret cnt
+end
+
+fn valHas pat view uchar * vlen ulong to bool
+pl = len pat
+if or eq pl 0 gt pl vlen
+ret false
+end
+lim = add sub vlen pl 1
+for i ulong lim bound 128
+ok = true
+for j ulong pl bound 64
+if ne get valBuf add i j get pat j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+note ---- Subcommand: plan ----
+fn printOnePlan pid ulong ccd ulong to void
+x86PlanTile pid 4 ccd
+if gt pGet pid PF_CCDS 1
+if eq ccd 0
+outText sCcd0
+else
+outText sCcd1
+end
+else
+outText sCcdU
+end
+outText sL1
+outNum pGet pid PF_L1D_KB
+outText sL2
+outNum pGet pid PF_L2_KB
+outText sL3
+outNum get tileOut 5
+outText sVec
+outNum pGet pid PF_VECBITS
+outText sTile
+outNum get tileOut 0
+outText sKc
+outNum get tileOut 1
+outText sNc
+outNum get tileOut 2
+outText sL3Nc
+outNum get tileOut 3
+outText sVe
+outNum get tileOut 4
+outText sFeat
+outHex pGet pid PF_FEAT
+outText sNl
+end
+
+fn cmdPlan to int
+outText sHdrPlan
+for pid ulong X86_NUM_PROFILES
+outText sProfPre
+outNum pid
+outText sProfMid
+outProfName pid
+outText sNl
+if gt pGet pid PF_CCDS 1
+printOnePlan pid 0
+printOnePlan pid 1
+else
+printOnePlan pid 0
+end
+end
+ret 0
+end
+
+note ---- Subcommand: probe ----
+fn cmdProbe to int
+outText sHdrProbe
+n = readCpuInfo
+if eq n 0
+outText sOutEnvOther
+ret 0
+end
+
+vn = cpuExtractVal sKeyVend
+isIntel = valHas sIntel vn
+isAmd = valHas sAmd vn
+if gt vn 0
+outText sOutVend
+w = write 1 valBuf 0 vn
+outText sNl
+end
+
+mn = cpuExtractVal sKeyModel
+if gt mn 0
+outText sOutModel
+w = write 1 valBuf 0 mn
+outText sNl
+end
+
+cn = cpuExtractVal sKeyCache
+if gt cn 0
+outText sOutCache
+w = write 1 valBuf 0 cn
+outText sNl
+end
+
+cpus = cpuCountLogical
+outText sOutCpus
+outNum cpus
+outText sNl
+
+hasHyp = cpuHasFlag sFHyp
+if or isIntel isAmd
+if hasHyp
+outText sOutEnvVm
+else
+outText sOutEnvBm
+end
+else
+outText sOutEnvOther
+end
+
+fmask = ulong 0
+if cpuHasFlag sFAvx2
+fmask = or fmask XF_AVX2
+end
+if cpuHasFlag sFAvx512
+fmask = or fmask XF_AVX512
+end
+if cpuHasFlag sFFma
+fmask = or fmask XF_FMA
+end
+if cpuHasFlag sFBmi2
+fmask = or fmask XF_BMI2
+end
+if cpuHasFlag sFAmx
+fmask = or fmask XF_AMX
+end
+if cpuHasFlag sFAes
+fmask = or fmask XF_AES
+end
+if cpuHasFlag sFSha
+fmask = or fmask XF_SHA
+end
+
+outText sOutFeat
+outHex fmask
+outText sNl
+
+outText sOutFlags
+if eq fmask 0
+outText sTagNone
+else
+if ne and fmask XF_AVX2 0
+outText sTagAvx2
+end
+if ne and fmask XF_AVX512 0
+outText sTagAvx512
+end
+if ne and fmask XF_FMA 0
+outText sTagFma
+end
+if ne and fmask XF_BMI2 0
+outText sTagBmi2
+end
+if ne and fmask XF_AMX 0
+outText sTagAmx
+end
+if ne and fmask XF_AES 0
+outText sTagAes
+end
+if ne and fmask XF_SHA 0
+outText sTagSha
+end
+end
+outText sNl
+
+note Select closest x86-64 profile from live detected vendor + ISA flags
+matched = PROF_INTEL_CORE_ULTRA
+if isIntel
+if ne and fmask XF_AVX512 0
+matched = PROF_INTEL_XEON_AMX
+else
+matched = PROF_INTEL_CORE_ULTRA
+end
+end
+if isAmd
+if ne and fmask XF_AVX512 0
+matched = PROF_AMD_ZEN5
+else
+matched = PROF_STEAM_DECK_ZEN2
+end
+end
+if or isIntel isAmd
+outText sOutMatch
+outProfName matched
+outText sNl
+printOnePlan matched 0
+end
+ret 0
+end
+
+note ---- Subcommand: selftest ----
+fn failTest id ulong to int
+outText sSelfFail
+outNum id
+outText sNl
+ret int id
+end
+
+fn cmdSelftest to int
+outText sHdrSelf
+chk = ulong 0
+ctrl = ulong 0
+
+note 1. Micro-kernel exact bit-level checks
+if not mkTestIntDot
+ret failTest 1
+end
+chk = add chk 1
+
+if not mkTestF32Dot
+ret failTest 2
+end
+chk = add chk 1
+
+if not mkTestGemvTile
+ret failTest 3
+end
+chk = add chk 1
+
+if not mkTestPrefixScan
+ret failTest 4
+end
+chk = add chk 1
+
+note 2. Positive physical feature contract checks across Intel & AMD profiles
+if ne x86CheckContract PROF_INTEL_CORE_ULTRA 13 256 48 36864 XCK_OK
+ret failTest 10
+end
+if ne x86CheckContract PROF_INTEL_XEON_AMX 31 512 48 107520 XCK_OK
+ret failTest 11
+end
+if ne x86CheckContract PROF_AMD_ZEN4 15 512 32 32768 XCK_OK
+ret failTest 12
+end
+if ne x86CheckContract PROF_AMD_ZEN5 15 512 48 32768 XCK_OK
+ret failTest 13
+end
+if ne x86CheckContract PROF_AMD_RYZEN_X3D 15 512 48 98304 XCK_OK
+ret failTest 14
+end
+if ne x86CheckContract PROF_STEAM_DECK_ZEN2 13 256 32 4096 XCK_OK
+ret failTest 15
+end
+chk = add chk 6
+
+note 3. Negative physical contract refusal controls (MUST refuse invalid ISA/cache requirements!)
+note Control 1: Steam Deck Zen 2 MUST refuse AVX-512
+if ne x86CheckContract PROF_STEAM_DECK_ZEN2 XF_AVX512 256 32 4096 XCK_ERR_MISSING_AVX512
+ret failTest 20
+end
+ctrl = add ctrl 1
+
+note Control 2: Intel Core Ultra MUST refuse AVX-512
+if ne x86CheckContract PROF_INTEL_CORE_ULTRA XF_AVX512 256 48 36864 XCK_ERR_MISSING_AVX512
+ret failTest 21
+end
+ctrl = add ctrl 1
+
+note Control 3: AMD Ryzen X3D MUST refuse Intel AMX
+if ne x86CheckContract PROF_AMD_RYZEN_X3D XF_AMX 512 48 98304 XCK_ERR_MISSING_AMX
+ret failTest 22
+end
+ctrl = add ctrl 1
+
+note Control 4: Intel Xeon AMX MUST refuse L1D overflow (96 KiB > 48 KiB)
+if ne x86CheckContract PROF_INTEL_XEON_AMX XF_AVX512 512 96 32768 XCK_ERR_L1_OVERFLOW
+ret failTest 23
+end
+ctrl = add ctrl 1
+
+note Control 5: Steam Deck Zen 2 MUST refuse L3 overflow (8192 KiB > 4096 KiB)
+if ne x86CheckContract PROF_STEAM_DECK_ZEN2 XF_AVX2 256 32 8192 XCK_ERR_L3_OVERFLOW
+ret failTest 24
+end
+ctrl = add ctrl 1
+
+note Control 6: Steam Deck Zen 2 MUST refuse 512-bit vector width
+if ne x86CheckContract PROF_STEAM_DECK_ZEN2 XF_AVX2 512 32 4096 XCK_ERR_VEC_WIDTH
+ret failTest 25
+end
+ctrl = add ctrl 1
+
+note Control 7: Out-of-range profile ID MUST be refused
+if ne x86CheckContract 99 XF_AVX2 256 32 4096 XCK_ERR_BAD_PROFILE
+ret failTest 26
+end
+ctrl = add ctrl 1
+chk = add chk 7
+
+note 4. Cache-aware tile planning invariants (X3D CCD0 96 MiB V-Cache vs CCD1 32 MiB vs Zen 2 4 MiB)
+x86PlanTile PROF_AMD_RYZEN_X3D 4 0
+x3dCcd0L3 = get tileOut 3
+x3dCcd0Kb = get tileOut 5
+x3dVe = get tileOut 4
+
+x86PlanTile PROF_AMD_RYZEN_X3D 4 1
+x3dCcd1L3 = get tileOut 3
+x3dCcd1Kb = get tileOut 5
+
+x86PlanTile PROF_STEAM_DECK_ZEN2 4 0
+deckL3 = get tileOut 3
+deckVe = get tileOut 4
+
+if or ne x3dCcd0Kb 98304 ne x3dCcd1Kb 32768
+ret failTest 30
+end
+if le x3dCcd0L3 x3dCcd1L3
+ret failTest 31
+end
+if le x3dCcd1L3 deckL3
+ret failTest 32
+end
+if or ne x3dVe 16 ne deckVe 8
+ret failTest 33
+end
+chk = add chk 4
+
+outText sSelfPass
+outNum chk
+outText sSelfCtrl
+outNum ctrl
+outText sNl
+ret 0
+end
+
+note ---- Subcommand: check <prof_id> <req_feat_mask> ----
+fn parseDecArg which ulong blen ulong to ulong
+if eq blen 0
+ret 999999
+end
+v = ulong 0
+for i ulong blen bound 32
+ch = uchar 0
+if eq which 2
+ch = get arg2Buf i
+else
+ch = get arg3Buf i
+end
+if or lt ch 48 gt ch 57
+ret 999999
+end
+v = add mul v 10 ulong sub ch 48
+end
+ret v
+end
+
+fn cmdCheck to int
+if ne argcnt 4
+outText sUsage
+ret 2
+end
+l2 = argread 2 arg2Buf 0 64
+l3 = argread 3 arg3Buf 0 64
+if or le l2 0 le l3 0
+outText sUsage
+ret 2
+end
+pid = parseDecArg 2 ulong l2
+req = parseDecArg 3 ulong l3
+if or eq pid 999999 eq req 999999
+outText sUsage
+ret 2
+end
+rc = x86CheckContract pid req 0 0 0
+if eq rc XCK_OK
+outText sCkOk
+outNum pid
+outText sSp
+outProfName pid
+outText sNl
+ret 0
+end
+outText sCkRef
+outNum pid
+outText sCkCode
+outNum rc
+outText sCkRsn
+outRefusalReason rc
+outText sNl
+ret int rc
+end
+
+note ---- CLI Argument Matching ----
+fn argEq alen ulong pat view uchar * to bool
+if ne alen len pat
+ret false
+end
+for i ulong alen bound 64
+if ne get argBuf i get pat i
+ret false
+end
+end
+ret true
+end
+
+fn main to int
+x86InitProfiles
+ac = argcnt
+if lt ac 2
+outText sUsage
+ret 2
+end
+al = argread 1 argBuf 0 64
+if le al 0
+outText sUsage
+ret 2
+end
+au = ulong al
+if argEq au sCmdProbe
+ret cmdProbe
+end
+if argEq au sCmdPlan
+ret cmdPlan
+end
+if argEq au sCmdSelf
+ret cmdSelftest
+end
+if argEq au sCmdCheck
+ret cmdCheck
+end
+outText sUsage
+ret 2
+end

@@ -1,0 +1,7 @@
+build/
+out/
+*.elf
+*.bin
+*.tmp
+*.err
+.DS_Store

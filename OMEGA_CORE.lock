@@ -1,0 +1,5 @@
+# Pinned Omega Core reference compiler lock
+OMEGA_CORE_REPO=https://github.com/drakestapleton/omega-mv
+OMEGA_CORE_COMMIT=5132074dcc8a4a55e7acaa06be9d9b8698ead402
+OMC_PATH=seed/out/omc
+OMC_SHA256=85b84c6de85083e4d9d2368015c1ddcab3d863aada922be0e63d774dddf23134
